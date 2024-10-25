@@ -1,212 +1,232 @@
-# The lowest-level utilities, able to be imported anywhere
-
-# Global Package Imports
-import os
-import boto3
 from pathlib import Path
 import inject
-from omegaconf import DictConfig
-import hydra
-from hydra.core.global_hydra import GlobalHydra
 from omegaconf import DictConfig, OmegaConf
+import os
+import json
+import tempfile
 import logging
 
+from .utils import add_attribute
+from .session_manager import AWSSessionManager
 
-def configure_opt(app, **kwargs):
-    applications = {
-        "default": configure_opt_default,
-    }
-    return applications[app](**kwargs)
+logging.basicConfig(level=logging.INFO)
 
-def configure_opt_default(**kwargs):
-    return {
-        "application": "Unknown"
-        if "application" not in kwargs.keys()
-        else kwargs["application"],
-        "name_space": os.getenv("NAME_SPACE")
-        if "name_space" not in kwargs.keys()
-        else kwargs["name_space"],
-        "region": os.getenv("REGION")
-        if "region" not in kwargs.keys()
-        else kwargs["region"],
-        "s3_bucket": None if "s3_bucket" not in kwargs.keys() else kwargs["name_space"],
-        "s3_file": None if "s3_file" not in kwargs.keys() else kwargs["name_space"],
-        "current_directory": Path("../")
-        if "current_directory" not in kwargs.keys()
-        else kwargs["current_directory"],
-        "local_only": False,
-        "verbose": False,
-        "use_keys": False if "use_keys" not in kwargs.keys() else kwargs["use_keys"],
-    }
+class ConfigManager:
+    CONFIG_CACHE_PATH = Path(tempfile.gettempdir()) / "intellipat_config_cache.yaml"
+    CREDENTIALS_FILE = Path(tempfile.gettempdir()) / "aws_credentials.json"
 
-def find_key(data, target):
-    def search(data, target, path):
-        if isinstance(data, dict):
-            for key, value in data.items():
-                new_path = path + [key]
-                if key == target:
-                    return new_path
-                result = search(value, target, new_path)
-                if result is not None:
-                    return result
-        return None
+    def __init__(self):
+        self._config_cache = None
 
-    return search(data, target, [])
+    def config_binder(self, binder, cfg):
+        """Bind the configuration to the injector."""
+        binder.bind(DictConfig, cfg)
 
-
-def get_value(data, path):
-    for key in path:
-        if isinstance(data, dict):
-            data = data.get(key)
-            if data is None:
-                return None
-        else:
-            return None
-    return data
-
-
-def add_attribute(key, opt: dict):
-    if key not in opt:
+    def load_config(self, config_file: str):
+        """Load configuration from a local file and cache it on disk."""
         try:
-            config = inject.instance(DictConfig)
-            config_dict = OmegaConf.to_container(config, resolve=True)
-            path = find_key(config_dict, key)
-        except:
-            pass
+            self._config_cache = OmegaConf.load(config_file)
+            inject.configure(lambda binder: self.config_binder(binder, self._config_cache))
+            OmegaConf.save(self._config_cache, self.CONFIG_CACHE_PATH)
+            logging.info("Configuration loaded successfully from local file.")
+        except Exception as e:
+            logging.error(f"Error loading configuration: {e}")
 
-        if path is not None:
-            opt[key] = get_value(config_dict, path)
+    def load_default_config(self, config_file: str = 'config/default.yaml'):
+        """Load the default yaml from a local file"""
+        try:
+            default_config = OmegaConf.load(config_file)
+            environment = str(default_config['current_environment'])
+            if environment in default_config['downloadable_configs']:
+                s3_config_bucket = str(default_config['s3_config_bucket'])
+                s3_config_file = str(Path(f"{default_config['s3_config_path']}/{environment}.yaml"))
+                return s3_config_bucket, s3_config_file
+            else:
+                local_config_file = f"config/{environment}.yaml"
+                return None, local_config_file
+        except Exception as e:
+            logging.error(f"Error loading default configuration file: {e}")
 
+    def load_config_from_dict(self, dict_config_template: dict):
+        """Load the configuration from a dictionary"""
+        try:
+            self._config_cache = OmegaConf.create(dict_config_template)
+            inject.configure(lambda binder: self.config_binder(binder, self._config_cache))
+            logging.info("Configuration loaded successfully from dictionary.")
+        except Exception as e:
+            logging.error(f"Error loading configuration: {e}")
+
+    def load_config_from_s3(self, bucket: str, config_file: str, save_cache: bool = True):
+        """Load configuration from an S3 bucket and cache it on disk using AWSSessionManager."""
+        try:
+            # Use AWSSessionManager to get the current AWS session
+            aws_session_manager = AWSSessionManager.instance()
+            session = aws_session_manager.get_session()
+            
+            # Create S3 client from the AWS session
+            s3 = session.client('s3')
+            
+            # Fetch the configuration file from S3
+            s3_object = s3.get_object(Bucket=bucket, Key=config_file)
+            config_data = s3_object['Body'].read().decode('utf-8')
+            
+            # Create OmegaConf from the retrieved config data
+            self._config_cache = OmegaConf.create(config_data)
+            inject.configure(lambda binder: self.config_binder(binder, self._config_cache))
+
+            if save_cache:
+                if not hasattr(self, 'CONFIG_CACHE_PATH'):
+                    raise ValueError("CONFIG_CACHE_PATH is not defined.")
+
+                # Save the loaded config to a local cache
+                OmegaConf.save(self._config_cache, self.CONFIG_CACHE_PATH)
+            logging.info("Configuration loaded successfully from S3.")
+        except Exception as e:
+            logging.error(f"Error loading configuration from S3: {e}")
+
+    def load_config_from_default(self):
+        bucket, file = self.load_default_config()
+        if bucket is not None:
+            self.load_config_from_s3(bucket, file)
         else:
-            opt[key] = None
-    return opt
+            self.load_config(file)
 
+    def load_cached_config(self):
+        """Check and load cached configuration from disk."""
+        if self.CONFIG_CACHE_PATH.is_file():
+            try:
+                self._config_cache = OmegaConf.load(self.CONFIG_CACHE_PATH)
+                inject.configure(lambda binder: self.config_binder(binder, self._config_cache))
+                self.load_aws_credentials()
+                return True
+            except Exception as e:
+                logging.error(f"Error loading cached configuration: {e}")
+        return False
 
-def add_attributes(keys: list, opt: dict):
-    for key in keys:
-        opt = add_attribute(key, opt)
-    return opt
+    def load_aws_credentials(self):
+        """Load AWS credentials from the cached file."""
+        if os.path.exists(self.CREDENTIALS_FILE):
+            try:
+                with open(self.CREDENTIALS_FILE, 'r') as file:
+                    credentials = json.load(file)
+                    os.environ.update(credentials)
+                    logging.info("AWS credentials loaded from cache.")
+            except Exception as e:
+                logging.error(f"Error loading AWS credentials: {e}")
 
+    def test_aws_credentials(self):
+        """Test AWS credentials to check if they are valid."""
+        try:
+            # Use AWSSessionManager to validate the credentials
+            aws_session_manager = AWSSessionManager.instance()
+            session = aws_session_manager.get_session()
+            sts = session.client("sts")
+            sts.get_caller_identity()
+            return True
+        except Exception as e:
+            logging.error(f"Invalid AWS credentials: {e}")
+            return False
 
-def hydra_config_provider(environment: str, config_folder_path: str):
-    GlobalHydra.instance().clear()
-    hydra.initialize(config_path=str(config_folder_path), version_base=str(1.1))
-    cfg = hydra.compose(config_name=f"{environment}.yaml")
-    return cfg
+    def reset_aws_credentials(self):
+        """Reset AWS credentials for a session."""
+        keys_to_unset = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "REGION"]
+        for key in keys_to_unset:
+            os.environ.pop(key, None)
 
+        try:
+            aws_access_key_id = input("Enter your AWS Access Key ID: ").strip()
+            aws_secret_access_key = input("Enter your AWS Secret Access Key: ").strip()
+            aws_session_token = input("Enter your AWS Session Token: ").strip()
+            region = input("Enter your region: ").strip()
 
-def load_config(config_file: str) -> DictConfig:
-    cfg = OmegaConf.load(config_file)
-    return cfg
+            if not aws_access_key_id or not aws_secret_access_key or not aws_session_token:
+                raise ValueError("AWS credentials must not be empty.")
 
+            os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key_id
+            os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_access_key
+            os.environ["AWS_SESSION_TOKEN"] = aws_session_token
+            os.environ["REGION"] = region
 
-def init_omegaconf_config(config_folder: Path):
-    init_config = load_config(str(config_folder / "default.yaml"))
-    environment = str(init_config["current_environment"])
-    config_path = config_folder / f"{environment}.yaml"
-    return load_config(str(config_path))
+            credentials = {
+                "AWS_ACCESS_KEY_ID": aws_access_key_id,
+                "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
+                "AWS_SESSION_TOKEN": aws_session_token,
+                "REGION": region
+            }
 
+            with open(self.CREDENTIALS_FILE, 'w') as file:
+                json.dump(credentials, file)
 
-def init_hydra_config(config_folder: Path):
-    init_config = OmegaConf.load(str(config_folder / "default.yaml"))
-    environment = str(init_config["current_environment"])
-    return hydra_config_provider(environment, str(config_folder))
+            logging.info("AWS credentials have been reset and cached in the file.")
+        except Exception as e:
+            logging.error(f"Error resetting AWS credentials: {e}")
 
+    def ensure_config_loaded(self):
+        """Ensure configuration is loaded before executing commands."""
+        if not self.load_cached_config() or not self.test_aws_credentials():
+            raise Exception("Configuration must be loaded before running any other command.")
 
-def config_binder(binder, cfg):
-    # load_dotenv()
-    binder.bind(DictConfig, cfg)
+    def clear_cache(self):
+        """Clear cached configuration."""
+        if self.CONFIG_CACHE_PATH.is_file():
+            self.CONFIG_CACHE_PATH.unlink()
+            logging.info("Configuration cache cleared.")
+        else:
+            logging.info("No cached configuration found.")
 
-
-def init_config(config_folder: Path):
-    print(config_folder.resolve())
-    cfg = init_omegaconf_config(config_folder.resolve())
-    # cfg = init_hydra_config(config_folder)
-    inject.configure(lambda binder: config_binder(binder, cfg))
-
-
-def init_config_from_dict(dict_based_config):
-    # Initialize/bind an omegaconf config from a dictionary
-    cfg = OmegaConf.create(dict_based_config)
-    inject.configure(lambda binder: config_binder(binder, cfg))
+########################################################################################
 
 
 def setup_aws(opt={}):
     opt = add_attribute("region", opt)
-    use_keys = os.getenv("USE_KEYS")
+    try:
+        aws_session_manager = AWSSessionManager.instance(opt=opt)
+        session = aws_session_manager.get_session()
+        return session
+    except Exception as e:
+        logging.error(f"Unable to create AWS session. {e}")
+        raise e
+    
 
-    if use_keys is not None and use_keys == "true":
-        if os.getenv("AWS_SESSION_TOKEN") is not None:
-            session = boto3.Session(
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
-                region_name=opt["region"],
-            )
+def init_config(method, **kwargs):
+    """
+    Function to load configuration using the Configuration Manager class\n\n
+
+    Methods:\n
+        s3 - [bucket] and [config_file]. For the file, specify api/dev.yaml or gateway/dev.yaml.\n
+        local - [config_file]
+        dict - [dict_config_template]
+        default - No arguments
+    
+    """
+    config_manager = ConfigManager()
+    config_types = {
+        "s3": config_manager.load_config_from_s3,
+        "local": config_manager.load_config,
+        "dict": config_manager.load_config_from_dict,
+        "default": config_manager.load_config_from_default,
+    }
+
+    if method == "s3":
+        if 'bucket' in kwargs and 'config_file' in kwargs:
+            return config_types[method](kwargs['bucket'], kwargs['config_file'], kwargs.get('save_cache', True))
         else:
-            session = boto3.Session(
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                region_name=opt["region"],
-            )
+            raise ValueError("For 's3' method, 'bucket' and 'config_file' must be provided.")
+    
+    elif method == "local":
+        if 'config_file' in kwargs:
+            return config_types[method](kwargs['config_file'])
+        else:
+            raise ValueError("For 'local' method, 'config_file' must be provided.")
+    
+    elif method == "dict":
+        if 'dict_config_template' in kwargs:
+            return config_types[method](kwargs['dict_config_template'])
+        else:
+            raise ValueError("For 'dict' method, 'dict_config_template' must be provided.")
+    
+    elif method == "default":
+        return config_types[method]()
+    
     else:
-        session = boto3.Session(region_name=opt["region"])
-
-    return session
-
-
-def download_configs(config_folder):
-    # Config Setup
-    config_logger = logging.getLogger(__name__)
-    initial_config = OmegaConf.load(str(config_folder / "default.yaml"))
-    environment = str(initial_config["current_environment"])
-
-    if environment in initial_config["downloadable_configs"]:
-        s3_config_bucket = str(initial_config["s3_config_bucket"])
-        s3_config_file = str(
-            Path(str(initial_config["s3_config_path"])) / f"{environment}.yaml"
-        )
-        local_config_file = str(config_folder / f"{environment}.yaml")
-        running_in_aws = os.getenv("USE_KEYS")
-
-        if running_in_aws is not None and running_in_aws == "true":
-            # Local development, provide credentials via environment variables
-            if os.getenv("AWS_SESSION_TOKEN") is not None:
-                session = boto3.Session(
-                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                    aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
-                    region_name=initial_config["s3_config_region"],
-                )
-            else:
-                session = boto3.Session(
-                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                    region_name=initial_config["s3_config_region"],
-                )
-
-        else:
-            # In AWS, rely on the default credential provider chain (IAM role, etc.)
-            session = boto3.Session(region_name=initial_config["s3_config_region"])
-
-        s3_client = session.client("s3")
-
-        try:
-            s3_client.download_file(s3_config_bucket, s3_config_file, local_config_file)
-            config_logger.info(
-                f"Successfully updated local config {local_config_file} from {s3_config_bucket}/{s3_config_file}"
-            )
-        except Exception as e:
-            config_logger.error(
-                f"Error updating local config {local_config_file} from {s3_config_bucket}/{s3_config_file}: {e}"
-            )
-            raise e
-
-def setup_configs(config_folder):
-    config_folder = Path(config_folder)
-
-    download_configs(config_folder = config_folder)
-
-    init_config(config_folder)
-
-    cfg = inject.instance(DictConfig)
+        raise ValueError(f"Invalid method '{method}' specified.")
